@@ -1,0 +1,36 @@
+name: weekly-automerge
+
+# Merges a [weekly-game] PR once CI succeeds on it. Uses GH_AW_GITHUB_TOKEN (a
+# user PAT) for the merge so the resulting push to main triggers the Pages
+# deploy — pushes made with the default GITHUB_TOKEN do not trigger workflows.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge the green weekly-game PR
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN || github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          R="${{ github.repository }}"
+          PRS=$(gh api "repos/$R/commits/$HEAD_SHA/pulls" --jq '[.[] | select(.state == "open") | select(.title | startswith("[weekly-game]")) | .number] | .[]' || true)
+          if [ -z "$PRS" ]; then
+            echo "no open [weekly-game] PR for $HEAD_SHA — nothing to merge"
+            exit 0
+          fi
+          for n in $PRS; do
+            echo "merging PR #$n"
+            gh pr merge "$n" -R "$R" --squash --delete-branch
+          done
