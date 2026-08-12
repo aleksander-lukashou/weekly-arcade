@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Teleblock</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; color: #eee; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; height: 100vh; overflow: hidden; }
+    #header { padding: 8px 16px; display: flex; justify-content: space-between; align-items: center; width: 100%; }
+    #header a { color: #aaa; text-decoration: none; font-size: 14px; }
+    #header a:hover { color: #fff; }
+    #info { font-size: 13px; color: #888; text-align: center; padding: 2px 0 4px; }
+    #gameContainer { flex: 1; width: 100%; }
+    canvas { display: block; width: 100% !important; height: 100% !important; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <a href="../../index.html">← arcade</a>
+    <strong>Teleblock</strong>
+    <span></span>
+  </div>
+  <div id="info">Click / tap spam calls to block them before they reach your phone!</div>
+  <div id="gameContainer">
+    <script src="../../lib/kaboom.js"></script>
+    <script src="./game.js"></script>
+  </div>
+</body>
+</html>
