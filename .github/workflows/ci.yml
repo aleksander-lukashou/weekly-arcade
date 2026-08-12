@@ -203,6 +203,7 @@ jobs:
 
   deploy-preview:
     runs-on: ubuntu-latest
+    continue-on-error: true
     # Job-level grant: the PR-comment step posts via GITHUB_TOKEN, and the
     # target CI's workflow-level default is read-only (live-caught on
     # habit-tracker#35: "Resource not accessible by integration").
