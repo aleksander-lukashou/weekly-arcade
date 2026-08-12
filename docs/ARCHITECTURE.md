@@ -61,14 +61,16 @@ _Based on: PRD "Visual Quality & Issue-Driven Fix Loop"_
 
 **Satisfies:** FR-5, FR-6, FR-7, FR-8, FR-9, FR-10, FR-11
 
-**Triggering:** `issues` event with `labeled` action; filter: `label == "game-fix"`.
+**Triggering:** two triggers:
+(a) `issues` event with `labeled` action; filter: `label == "game-fix"` (attempt 1 and manual re-requests);
+(b) `workflow_run` on `CI` completion with `conclusion == failure` — the job proceeds only when the failed run's head branch belongs to an open `[game-fix]` PR whose linked issue (via `Fixes #<n>`) still carries the `game-fix` label and the attempt count is < 4. This is the concrete retry path: a red fix PR re-enters the loop as the next attempt (the failed PR is closed and its branch deleted before the retry).
 
 **Inputs:**
 - Issue number, title, body (contains the game path and the problem description)
-- Issue author (for FR-5 enforcement: if author is NOT the operator, workflow STOPs and posts a comment explaining only the operator may request fixes)
+- The `labeled` event's actor (`github.event.sender`) — the FR-5 gate checks WHO APPLIED THE LABEL, not who authored the issue: issues auto-filed by the visual-review agent are authored (and labeled) by the factory App identity (`darkest-factory[bot]`), which is a legitimate trigger per FR-3
 
 **Process:**
-1. **Precondition check (FR-5):** Verify the issue author is `aleksander-lukashou`. If not, comment "Only the repository owner may request automated game fixes" and exit.
+1. **Precondition check (FR-5/FR-3):** Verify the `game-fix` label was applied by an allowed actor: the operator (`aleksander-lukashou`) or the visual-review agent's App identity (`darkest-factory[bot]`). Any other actor: comment "Only the repository owner may request automated game fixes", REMOVE the `game-fix` label (so the state is self-healing), and exit. Checking the label actor rather than the issue author is what lets the visual reviewer's auto-filed issues trigger the loop (FR-3) while still excluding third parties (FR-5).
 2. Parse the issue body to extract the target game path (e.g., `games/2026-w33-call-dodger/`).
 3. Check for prior fix-attempt comments on this issue matching the pattern `**Factory fix attempt N/4**`. Count them to determine the current attempt number.
 4. If attempt count >= 4:
@@ -82,11 +84,11 @@ _Based on: PRD "Visual Quality & Issue-Driven Fix Loop"_
    - If the issue mentions specific objects (e.g., "the player character is a flat rectangle"), focus improvements there.
    - Preserve the game's controls, scoring, and mechanics; only modify visual rendering.
 8. Write the improved `game.js` back to `games/<path>/game.js`. Do NOT touch `index.html`, `manifest.json`, or other games.
-9. Open a draft PR titled `T<issue-number>: Fix visual quality — <game-title>`. The body references the issue (`Fixes #<issue-number>`) and quotes attempt N.
+9. Open a PR titled `[game-fix] <game-title> — fix #<issue-number>`. The body references the issue (`Fixes #<issue-number>`) and quotes attempt N. Deliberately NOT the factory's `T<n>:` ticket convention — that title would engage the vendored factory auto-merger, whose eligibility rules (App-bot author, `**Implementation complete**` comment, all nine scaffold `requiredChecks` from `.github/factory-config.json`) do not fit fix PRs and would leave them unmergeable.
 10. Post a comment on the issue: `**Factory fix attempt N/4** — PR #<pr-number> opened. Awaiting CI.`
 11. CI runs automatically (manifest validation + syntax check + gitleaks + dependency-gate from `ci.yml`).
 12. If CI passes: the `auto-merger.yml` workflow (already exists in the repo per README) will auto-merge the PR once it's green and not a draft. The fix agent marks the PR as ready for review before exiting.
-13. If CI fails: the workflow exits; GitHub's `workflow_run` event will re-trigger this workflow when the issue is still labeled `game-fix`, allowing retry.
+13. If CI fails: trigger (b) above fires on the CI completion event, closes the red PR, deletes its branch, and re-enters the loop as attempt N+1 (bounded by the 4-attempt cap at step 4). No human action is needed between attempts.
 
 **Safe-outputs:** `create_pull_request` (on each attempt), `add_comment` (attempt tracking + escalation)
 
@@ -94,15 +96,28 @@ _Based on: PRD "Visual Quality & Issue-Driven Fix Loop"_
 
 ---
 
-### 3. Auto-Merger (existing, no changes)
+### 3. Auto-Merge Path (extend the repo's own `weekly-automerge.yml`)
 
-**Responsibility:** Merge any PR (including fix PRs) once CI is green and the PR is marked ready for review.
+**Responsibility:** Merge fix PRs once CI is green, without human approval (FR-9).
 
 **Satisfies:** FR-9
 
-**File:** `.github/workflows/auto-merger.yml` (already exists; no architectural changes required)
+**File:** `.github/workflows/weekly-automerge.yml` (this repo's own automerge — extend its title filter from
+`[weekly-game]` to `[weekly-game]` OR `[game-fix]`). The merge continues to use `GH_AW_GITHUB_TOKEN` so the
+resulting push to `main` triggers the Pages deploy.
 
-**Integration point:** The fix agent marks its draft PR as "ready for review" after opening it. The auto-merger watches for `pull_request` events with `ready_for_review` action and checks CI status. If all checks pass, it merges.
+**Explicitly NOT used:** the vendored factory `auto-merger.yml`. Its merge-eligibility contract (App-bot author +
+`**Implementation complete**` comment + ALL `requiredChecks` from `.github/factory-config.json` green) requires the
+nine-gate scaffold suite, while this repository's CI currently produces five checks (`validate`, `tests-guard`,
+`secret-scan`, `dependency-gate`, `migration-gate`).
+
+**Required prerequisite for the FACTORY ticket PRs implementing this epic:** those PRs DO ride the factory
+auto-merger, so the gate mismatch must be closed first. Decision: add the five missing scaffold gates (`unit`,
+`integration`, `coverage`, `lint`, `typecheck`) to `ci.yml` as minimal real jobs (e.g. `unit` runs `node --test`
+over a `tests/` tree when present, `lint`/`typecheck` start as `node --check`-grade validations) rather than
+trimming `factory-config.json` — trimming would fight the registry reconciler's config-drift check and the
+`factory-gate` ruleset, both of which expect the canonical nine. This restores the full suite the plumbing
+assumes and lets the branch ruleset return to the canonical gate list.
 
 ---
 
@@ -151,7 +166,7 @@ _Based on: PRD "Visual Quality & Issue-Driven Fix Loop"_
 
 #### Pull Request (GitHub PRs API)
 - **Number** (primary key)
-- **Title** (e.g., `T42: Fix visual quality — Call Dodger`)
+- **Title** (e.g., `[game-fix] Call Dodger — fix #42`)
 - **Body** (references the issue via `Fixes #<n>`)
 - **Draft status** (boolean; fix PRs start as drafts, then marked ready)
 - **CI status** (checks via GitHub Checks API)
@@ -234,7 +249,7 @@ No REST API is introduced. All components interact via:
 |----------|----------|-----------|
 | **1. Visual review trigger timing** | Post-merge (after `weekly-game` PR is merged and game is live on `main`) | Simplest integration point; no changes to existing `weekly-game.md` workflow. Uses `workflow_run` event. Trade-off: a low-quality game may be live for a few hours before the fix loop starts. Acceptable for v1 given the site's low traffic. |
 | **2. Review scoring rubric** | 3-point scale (PASS/BORDERLINE/FAIL) with GPT-4 Vision analysis of a Puppeteer screenshot | Puppeteer is lightweight and runs in GitHub Actions without new infra. Vision model is accessed via Copilot tools (no new API auth). The rubric prompt is explicit: "Are objects recognizable?" with the headline as context. |
-| **3. `game-fix` label permission enforcement** | Workflow validation (check issue author == operator) + trust | GitHub does not natively support label-specific CODEOWNERS. A workflow-level check at the start of the fix agent rejects non-operator labels. If stricter enforcement is needed post-v1, a GitHub App webhook can be added. |
+| **3. `game-fix` label permission enforcement** | Workflow validation: the `labeled` event's actor must be the operator or `darkest-factory[bot]` (the visual-review agent); anyone else's label is removed with an explanatory comment | GitHub does not natively support label-specific CODEOWNERS. Gating on the label ACTOR (not issue author) keeps FR-3's bot-filed issues working while excluding third parties. If stricter enforcement is needed post-v1, a GitHub App webhook can be added. |
 | **4. Fix attempt counting** | Issue comments matching `**Factory fix attempt N/4**` | The fix workflow queries issue comments via GitHub API at startup, counts matches, and increments. This is the same pattern the factory's `fix-ticket.md` workflow uses. No new storage required. |
 
 ---
@@ -242,3 +257,4 @@ No REST API is introduced. All components interact via:
 ## Changelog
 
 - 2026-08-12: Initial architecture (v1 scope)
+- 2026-08-12: Operator-review corrections — FR-5 gate checks the label actor (operator or `darkest-factory[bot]`) instead of issue author so FR-3's auto-filed issues can trigger the loop; concrete `workflow_run`-based retry trigger defined; fix PRs use the `[game-fix]` title + extended `weekly-automerge.yml` instead of the factory `T<n>:` auto-merger path; five missing scaffold gates to be added to `ci.yml` so factory ticket PRs are auto-mergeable.
