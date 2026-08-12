@@ -1,0 +1,316 @@
+# Non-agentic plumbing: forwards this repo's events to the factory
+# (darkest-factory), which cannot listen to another repo's events directly.
+# Inspects which paths a main push touched and fires the matching
+# repository_dispatch event(s) the factory's agentic workflows subscribe to.
+# Requires secret FACTORY_DISPATCH_PAT (contents: write on the factory, for
+# repository_dispatch only). Local repo operations (labels, issues, PRs) use
+# this workflow's own ambient GITHUB_TOKEN -- never an App token; this file runs
+# inside each onboarded target repo, where factory App credentials do not exist.
+name: factory-forwarder
+
+on:
+  pull_request:
+    types: [opened]
+  push:
+    branches: [main]
+    paths:
+      - "discovery/**"
+      - "docs/PRD.md"
+      - "docs/ARCHITECTURE.md"
+  issues:
+    types: [labeled]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  ci-failed:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # head_branch and html_url are attacker-influenced (fork PRs reach this
+      # workflow_run job with secrets + a writable token). Never interpolate them
+      # into the script body — a branch named $( ) would execute; read from env.
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+    steps:
+      - name: Orchestrator-managed guard (Phase 3 D-09)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # For an orchestrator_managed tenant the orchestrator owns dispatch, so
+          # this forwarder neutralizes every repository_dispatch (and the
+          # side-effects that precede it) below — no double-dispatch by
+          # construction (D-09). The vendored, read-only projection is read via the
+          # contents API (no checkout). Missing file/key or any non-true value ->
+          # proceed unchanged (same UNMANAGED default as advancer-mode.sh; v2 keeps
+          # working).
+          CFG=$(gh api "repos/${{ github.repository }}/contents/.github/factory-config.json" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo '{}')
+          MANAGED=$(echo "$CFG" | jq -r '.orchestrator_managed // false' 2>/dev/null || echo false)
+          if [ "$MANAGED" = "true" ]; then
+            echo "skip: orchestrator-managed tenant — forwarder dispatch disabled (Phase 3 D-09)"
+          fi
+          echo "managed=$MANAGED" >> "$GITHUB_OUTPUT"
+      - name: Count attempts, escalate or dispatch tests-failed
+        if: steps.guard.outputs.managed != 'true'
+        run: |
+          BRANCH="$HEAD_BRANCH"
+          PR=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number')
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then
+            if [ "$BRANCH" != "main" ]; then
+              echo "No open PR for branch $BRANCH — nothing to do"; exit 0
+            fi
+            # main is red with no PR to fix — the tests-failed loop cannot see
+            # this, so surface it as an issue instead (one open issue, appended
+            # to on repeat failures, closed by whoever greens main).
+            gh label create main-red -R "$GITHUB_REPOSITORY" --force \
+              --color B60205 --description "CI is failing on main"
+            EXISTING=$(gh issue list -R "$GITHUB_REPOSITORY" --label main-red --state open \
+              --json number --jq '.[0].number')
+            if [ -z "$EXISTING" ] || [ "$EXISTING" = "null" ]; then
+              gh issue create -R "$GITHUB_REPOSITORY" --label main-red \
+                --title "main CI is red" \
+                --body "CI failed on \`main\` and there is no open PR, so the factory's tests-failed fix loop cannot act on it. A human needs to fix main (or file an agent-ready ticket for it) and close this issue once main is green. Failing run: $RUN_URL"
+            else
+              gh issue comment "$EXISTING" -R "$GITHUB_REPOSITORY" \
+                --body "main is still red: $RUN_URL"
+            fi
+            exit 0
+          fi
+          DONE=$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json comments \
+            --jq '[.comments[].body | select(startswith("**Implementation complete**"))] | length')
+          if [ "$DONE" -eq 0 ]; then
+            echo "PR #$PR is in TDD red phase (no implementation yet) — not dispatching tests-failed"; exit 0
+          fi
+          ATTEMPTS=$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json comments \
+            --jq '[.comments[].body | select(startswith("**Factory fix attempt"))] | length')
+          echo "PR #$PR, prior factory fix attempts: $ATTEMPTS"
+          if [ "$ATTEMPTS" -ge 3 ]; then
+            gh pr edit "$PR" -R "$GITHUB_REPOSITORY" --add-label agent-blocked
+            gh pr comment "$PR" -R "$GITHUB_REPOSITORY" \
+              --body "**agent-blocked**: CI is still red after 3 factory fix attempts. A human needs to look at this PR."
+            exit 0
+          fi
+          # Build the dispatch payload with jq (never string-interpolate the
+          # attacker-influenced branch name into a JSON literal — a name with a
+          # double-quote would break out of the payload).
+          PAYLOAD=$(jq -n --arg repo "$GITHUB_REPOSITORY" --argjson pr "$PR" \
+            --arg branch "$BRANCH" --argjson attempt "$((ATTEMPTS+1))" \
+            '{event_type:"tests-failed",client_payload:{repo:$repo,pr:$pr,branch:$branch,attempt:$attempt}}')
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.FACTORY_DISPATCH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/aleksander-lukashou/darkest-factory/dispatches \
+            -d "$PAYLOAD"
+
+  ticket-ready:
+    if: github.event_name == 'issues' && github.event.label.name == 'agent-ready'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Orchestrator-managed guard (Phase 3 D-09)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Managed tenant -> orchestrator owns dispatch; neutralize below (D-09).
+          # Missing config/key -> proceed unchanged (UNMANAGED default).
+          CFG=$(gh api "repos/${{ github.repository }}/contents/.github/factory-config.json" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo '{}')
+          MANAGED=$(echo "$CFG" | jq -r '.orchestrator_managed // false' 2>/dev/null || echo false)
+          if [ "$MANAGED" = "true" ]; then
+            echo "skip: orchestrator-managed tenant — forwarder dispatch disabled (Phase 3 D-09)"
+          fi
+          echo "managed=$MANAGED" >> "$GITHUB_OUTPUT"
+      - name: Dispatch ticket-ready to factory
+        if: steps.guard.outputs.managed != 'true'
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.FACTORY_DISPATCH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/aleksander-lukashou/darkest-factory/dispatches \
+            -d "{\"event_type\":\"ticket-ready\",\"client_payload\":{\"repo\":\"${{ github.repository }}\",\"issue\":${{ github.event.issue.number }}}}"
+
+  change-request:
+    if: github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'change-request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Orchestrator-managed guard (Phase 3 D-09)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Managed tenant -> orchestrator owns dispatch; neutralize below (D-09).
+          # Missing config/key -> proceed unchanged (UNMANAGED default).
+          CFG=$(gh api "repos/${{ github.repository }}/contents/.github/factory-config.json" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo '{}')
+          MANAGED=$(echo "$CFG" | jq -r '.orchestrator_managed // false' 2>/dev/null || echo false)
+          if [ "$MANAGED" = "true" ]; then
+            echo "skip: orchestrator-managed tenant — forwarder dispatch disabled (Phase 3 D-09)"
+          fi
+          echo "managed=$MANAGED" >> "$GITHUB_OUTPUT"
+      - name: Dispatch change-request to factory
+        if: steps.guard.outputs.managed != 'true'
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.FACTORY_DISPATCH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/aleksander-lukashou/darkest-factory/dispatches \
+            -d "{\"event_type\":\"change-request\",\"client_payload\":{\"repo\":\"${{ github.repository }}\",\"issue\":${{ github.event.issue.number }}}}"
+
+  uat-rejected:
+    if: github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'uat-rejected'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Orchestrator-managed guard (Phase 3 D-09)
+        id: guard
+        run: |
+          set -euo pipefail
+          # Managed tenant -> orchestrator owns the CR-issue creation AND dispatch;
+          # neutralize the entire step below before any side-effect (D-09).
+          # Missing config/key -> proceed unchanged (UNMANAGED default).
+          CFG=$(gh api "repos/${{ github.repository }}/contents/.github/factory-config.json" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo '{}')
+          MANAGED=$(echo "$CFG" | jq -r '.orchestrator_managed // false' 2>/dev/null || echo false)
+          if [ "$MANAGED" = "true" ]; then
+            echo "skip: orchestrator-managed tenant — forwarder dispatch disabled (Phase 3 D-09)"
+          fi
+          echo "managed=$MANAGED" >> "$GITHUB_OUTPUT"
+      - name: File change-request from UAT rejection and dispatch
+        if: steps.guard.outputs.managed != 'true'
+        run: |
+          R="${{ github.repository }}"
+          UAT=${{ github.event.issue.number }}
+          gh label create change-request -R "$R" --force --color D93F0B --description "Product feedback for the factory"
+          CR_URL=$(gh issue create -R "$R" --label change-request \
+            --title "CR: UAT rejection on #$UAT" \
+            --body "Auto-filed from a UAT rejection. Source: #$UAT — the rejection specifics (comments, unchecked scenarios) live there. The factory's triage agent will size and route this.")
+          CR=$(basename "$CR_URL")
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.FACTORY_DISPATCH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/aleksander-lukashou/darkest-factory/dispatches \
+            -d "{\"event_type\":\"change-request\",\"client_payload\":{\"repo\":\"$R\",\"issue\":$CR}}"
+
+  tests-ready:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'opened' &&
+      github.event.pull_request.draft == true
+    runs-on: ubuntu-latest
+    env:
+      # PR title and head.ref are attacker-controlled free text. Never interpolate
+      # them into the script body (a title of $( ) executes) or into a JSON literal
+      # (a " breaks out of the payload) — read from env and build JSON with jq.
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Orchestrator-managed guard (Phase 3 D-09)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Managed tenant -> orchestrator owns dispatch; neutralize below (D-09).
+          # Missing config/key -> proceed unchanged (UNMANAGED default).
+          CFG=$(gh api "repos/${{ github.repository }}/contents/.github/factory-config.json" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo '{}')
+          MANAGED=$(echo "$CFG" | jq -r '.orchestrator_managed // false' 2>/dev/null || echo false)
+          if [ "$MANAGED" = "true" ]; then
+            echo "skip: orchestrator-managed tenant — forwarder dispatch disabled (Phase 3 D-09)"
+          fi
+          echo "managed=$MANAGED" >> "$GITHUB_OUTPUT"
+      - name: Dispatch tests-ready for test-writer draft PRs
+        if: steps.guard.outputs.managed != 'true'
+        run: |
+          TITLE="$PR_TITLE"
+          if ! echo "$TITLE" | grep -qE '^T[0-9]+:'; then
+            echo "Not a ticket PR — nothing to do"; exit 0
+          fi
+          PAYLOAD=$(jq -n --arg repo "$GITHUB_REPOSITORY" --argjson pr "$PR_NUMBER" \
+            --arg branch "$HEAD_REF" \
+            '{event_type:"tests-ready",client_payload:{repo:$repo,pr:$pr,branch:$branch}}')
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.FACTORY_DISPATCH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/aleksander-lukashou/darkest-factory/dispatches \
+            -d "$PAYLOAD"
+
+  route:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Orchestrator-managed guard (Phase 3 D-09)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Managed tenant -> orchestrator owns dispatch; neutralize every route
+          # dispatch below (D-09). Missing config/key -> proceed unchanged.
+          CFG=$(gh api "repos/${{ github.repository }}/contents/.github/factory-config.json" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo '{}')
+          MANAGED=$(echo "$CFG" | jq -r '.orchestrator_managed // false' 2>/dev/null || echo false)
+          if [ "$MANAGED" = "true" ]; then
+            echo "skip: orchestrator-managed tenant — forwarder dispatch disabled (Phase 3 D-09)"
+          fi
+          echo "managed=$MANAGED" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: changes
+        run: |
+          if git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
+            CHANGED=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")
+          else
+            CHANGED=$(git show --name-only --format= "${{ github.sha }}")
+          fi
+          echo "$CHANGED"
+          echo "discovery=$(echo "$CHANGED" | grep -q '^discovery/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "prd=$(echo "$CHANGED" | grep -q '^docs/PRD.md$' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "architecture=$(echo "$CHANGED" | grep -q '^docs/ARCHITECTURE.md$' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch discovery-answered
+        if: steps.changes.outputs.discovery == 'true' && steps.guard.outputs.managed != 'true'
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.FACTORY_DISPATCH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/aleksander-lukashou/darkest-factory/dispatches \
+            -d "{\"event_type\":\"discovery-answered\",\"client_payload\":{\"repo\":\"${{ github.repository }}\",\"sha\":\"${{ github.sha }}\"}}"
+
+      - name: Dispatch prd-merged
+        if: steps.changes.outputs.prd == 'true' && steps.guard.outputs.managed != 'true'
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.FACTORY_DISPATCH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/aleksander-lukashou/darkest-factory/dispatches \
+            -d "{\"event_type\":\"prd-merged\",\"client_payload\":{\"repo\":\"${{ github.repository }}\",\"sha\":\"${{ github.sha }}\"}}"
+
+      - name: Dispatch architecture-merged
+        if: steps.changes.outputs.architecture == 'true' && steps.guard.outputs.managed != 'true'
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.FACTORY_DISPATCH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/aleksander-lukashou/darkest-factory/dispatches \
+            -d "{\"event_type\":\"architecture-merged\",\"client_payload\":{\"repo\":\"${{ github.repository }}\",\"sha\":\"${{ github.sha }}\"}}"

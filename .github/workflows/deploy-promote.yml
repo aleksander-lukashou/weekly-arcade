@@ -1,0 +1,116 @@
+# Non-agentic plumbing: promotes main -> prod when the orchestrator fires a
+# `promote-requested` repository_dispatch (07-04's __promote__ dispatcher branch).
+# Promotion is git's OWN fast-forward refusal (`git push --ff-only`) — the SOLE
+# D-01/D-02 enforcement point; there is no custom merge-strategy script to coerce.
+# ANY failure (non-ff history, or a prod deploy that never appears) is a LOUD halt:
+# it opens/comments the EXISTING `factory-blocked` gate issue — never an auto-rollback
+# (D-04). That gate is already ingested by the orchestrator (issues.ts -> gate_issues)
+# and halts every subsequent decision for this tenant via decide.ts's gatesOpen check,
+# with zero new orchestrator code.
+#
+# Runs INSIDE each onboarded target repo (vendored verbatim by plan 07-08), so it uses
+# the workflow's own ambient ${{ github.token }} — never a minted factory App key (that
+# would be a cross-tenant EoP). CF Pages verification uses the target's own
+# CLOUDFLARE_* secrets; the orchestrator never holds deploy credentials.
+name: deploy-promote
+
+on:
+  repository_dispatch:
+    types: [promote-requested]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # client_payload shape fired by 07-04's dispatcher:
+      #   { "epic": 12, "idempotency_key": "v1:owner/repo:promote:E_xxx:1" }
+      EPIC: ${{ github.event.client_payload.epic }}
+      IDEMPOTENCY_KEY: ${{ github.event.client_payload.idempotency_key }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Check out full history (fetch-depth 0 required for --ff-only)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward main -> prod, verify prod deploy, or halt loud
+        env:
+          # Target-side CF Pages credentials (provisioned by 07-08). Absent when the
+          # tenant has no Pages surface — the deploy-verify step degrades gracefully.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PAGES_PROJECT: ${{ vars.PAGES_PROJECT }}
+        run: |
+          set -euo pipefail
+
+          # D-04 loud-halt escalation via the EXISTING factory-blocked gate. Both the
+          # ff-merge failure branch AND the missing-prod-deploy branch call this — they
+          # reach the same gate (one open issue, appended to on repeat failures). Reuses
+          # the factory-forwarder.yml label-create --force / open-issue / comment-or-create
+          # idiom; never invents a new gate label.
+          escalate() {
+            reason="$1"
+            gh label create factory-blocked -R "$GITHUB_REPOSITORY" --force \
+              --color B60205 --description "Factory pipeline halted, needs a human" 2>/dev/null || true
+            EXISTING=$(gh issue list -R "$GITHUB_REPOSITORY" --label factory-blocked --state open \
+              --json number --jq '.[0].number' 2>/dev/null || echo "")
+            if [ -z "$EXISTING" ] || [ "$EXISTING" = "null" ]; then
+              gh issue create -R "$GITHUB_REPOSITORY" --label factory-blocked \
+                --title "Promotion halted for E${EPIC}" \
+                --body "${reason} (idempotency_key: ${IDEMPOTENCY_KEY}). Promotion for this tenant halts until a human resolves and closes this issue — the factory will NOT auto-rollback. Run: ${RUN_URL}" \
+                2>/dev/null || true
+            else
+              gh issue comment "$EXISTING" -R "$GITHUB_REPOSITORY" \
+                --body "Promotion attempt for E${EPIC} also failed: ${reason} (idempotency_key: ${IDEMPOTENCY_KEY}). Run: ${RUN_URL}" \
+                2>/dev/null || true
+            fi
+          }
+
+          # D-02: promotion IS git's own fast-forward refusal — no custom merge logic.
+          # First promotion bootstraps prod from main (creation is trivially ff) —
+          # a hard `git fetch origin main prod` here died with exit 128 BEFORE the
+          # escalate-wrapped push on the first-ever promotion (live-caught on
+          # habit-tracker E37, run 31427716391), so prod is fetched tolerantly and
+          # any unexpected fatal still escalates via the ERR trap.
+          trap 'escalate "promotion step failed unexpectedly (see run log)"' ERR
+          git fetch origin main
+          if ! git fetch origin prod 2>/dev/null; then
+            echo "prod branch does not exist yet — first promotion bootstraps it from main"
+          fi
+          # NOTE: `git push` has no --ff-only flag (that is a merge/pull option —
+          # live-caught, run 31428795848). A plain push IS fast-forward-only: the
+          # remote rejects any non-ff update unless forced, which is exactly the
+          # D-02 semantic.
+          if ! git push origin origin/main:refs/heads/prod; then
+            echo "::error::fast-forward main->prod failed — non-ff or diverged history (D-04 loud halt)"
+            escalate "Fast-forward main->prod failed (non-ff or diverged history)"
+            exit 1
+          fi
+          trap - ERR
+          echo "main fast-forwarded onto prod"
+
+          # D-04 "red prod deploy" mode: onboarded targets are DIRECT-UPLOAD Pages
+          # projects (no CF Git integration), and pushes made with the ambient
+          # github.token do not trigger the target's own CI (GitHub recursion
+          # guard — live-caught, run 31429454001). So this workflow IS the prod
+          # deploy mechanism: it deploys the just-promoted tree with --branch=prod
+          # (= the project's production_branch = a PRODUCTION deployment). A deploy
+          # failure is the loud halt. No PAGES_PROJECT -> this tenant has no Pages
+          # surface, promotion is the ff-merge alone (deploy surface optional).
+          if [ -z "${PAGES_PROJECT:-}" ]; then
+            echo "No PAGES_PROJECT configured — no CF Pages surface to deploy; promotion complete"
+            exit 0
+          fi
+
+          git checkout --quiet origin/main
+          if ! npx --yes wrangler pages deploy . --project-name="$PAGES_PROJECT" --branch=prod; then
+            echo "::error::prod deploy failed after ff-merge — red prod deploy (D-04 loud halt)"
+            escalate "prod deploy failed after a successful ff-merge (red prod deploy)"
+            exit 1
+          fi
+          echo "prod deployment complete (production environment)"
