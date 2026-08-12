@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Call Dodger</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; color: #eee; font-family: monospace; display: flex; flex-direction: column; align-items: center; height: 100vh; overflow: hidden; }
+    header { padding: 8px 16px; display: flex; justify-content: space-between; align-items: center; width: 100%; max-width: 800px; }
+    header a { color: #aaa; text-decoration: none; font-size: 13px; }
+    header a:hover { color: #fff; }
+    h1 { font-size: 16px; color: #fff; }
+    p.how { font-size: 12px; color: #888; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="../../index.html">← arcade</a>
+    <div style="text-align:center">
+      <h1>📵 Call Dodger</h1>
+      <p class="how">Dodge the spam calls! Arrow keys / WASD to move · Space to hang up · Tap to play</p>
+    </div>
+    <span></span>
+  </header>
+  <script src="../../lib/kaboom.js"></script>
+  <script src="./game.js"></script>
+</body>
+</html>

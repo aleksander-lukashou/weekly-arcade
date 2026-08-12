@@ -1,3 +1,12 @@
 {
-  "games": []
+  "games": [
+    {
+      "slug": "call-dodger",
+      "title": "Call Dodger",
+      "date": "2026-08-12",
+      "headline": "France bans unsolicited telemarketing calls",
+      "source": "https://www.bbc.co.uk/news/articles/cy5d11g72ppo",
+      "path": "games/2026-w33-call-dodger/"
+    }
+  ]
 }
