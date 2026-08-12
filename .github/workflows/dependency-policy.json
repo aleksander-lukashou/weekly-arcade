@@ -1,0 +1,19 @@
+{
+  "_comment": "D-08 factory-versioned dependency provenance policy. The dependency-gate CI check (docs/target-plumbing/dependency-gate.mjs) reads THIS factory-vendored copy, never a PR's own tree. allowedLicenses is the SPDX allowlist; minAgeDays/minWeeklyDownloads are provenance floors; maxNameDistance is the Levenshtein typosquat threshold against popularPackages. The popularPackages seed covers this factory's own stack plus common Node ecosystem names as the typosquat-distance reference set. This list grows ONLY via a reviewed factory PR — never a target-side edit.",
+  "allowedLicenses": ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC"],
+  "minAgeDays": 30,
+  "minWeeklyDownloads": 200,
+  "maxNameDistance": 2,
+  "popularPackages": [
+    "react",
+    "express",
+    "lodash",
+    "axios",
+    "vitest",
+    "typescript",
+    "hono",
+    "octokit",
+    "better-sqlite3",
+    "ajv"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "repo": "aleksander-lukashou/weekly-arcade",
+  "autonomy": "auto",
+  "orchestrator_managed": false,
+  "requiredChecks": [
+    "unit",
+    "integration",
+    "coverage",
+    "lint",
+    "typecheck",
+    "tests-guard",
+    "secret-scan",
+    "dependency-gate",
+    "migration-gate"
+  ],
+  "appBotLogin": "darkest-factory[bot]",
+  "appBotNodeId": "BOT_kgDOEqeVhQ"
+}

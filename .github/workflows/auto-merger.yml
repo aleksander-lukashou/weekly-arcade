@@ -1,0 +1,88 @@
+# Auto-merges factory ticket PRs once the FULL GATE-02 precondition set passes.
+# Preconditions (all required, evaluated in merge-eligibility.sh):
+#   1. hold label absent            2. App-bot author + every commit verified (TEN-04)
+#   3. all 6 GATE-01 checks green    4. registry autonomy flag == "auto"       (TEN-04)
+# plus the "**Implementation complete**" TDD-red-phase comment gate (kept below).
+#
+# D-16: this bash gate is the SOLE GATE-02 enforcement in Phase 2 — GitHub-native
+# rulesets/branch protection are unavailable on this account's plan (RESEARCH
+# Finding 1), so NO structural "GitHub itself refuses the merge" backstop exists.
+# Getting these preconditions right here IS the merge gate's integrity. Residual:
+# a human can still bypass this by clicking Merge in the UI (T-09-02, accepted).
+#
+# Config (appBotNodeId / requiredChecks / autonomy) is read from the vendored,
+# same-repo .github/factory-config.json — never a live cross-repo read of the
+# factory-only targets.json / contracts/scaffold-gates.json.
+#
+# Runs INSIDE each onboarded target repo (vendored verbatim by plan 02-11), so it
+# uses the workflow's own ambient ${{ github.token }} — never the wide FACTORY_PAT
+# secret and never a minted App token (the App private key must never be copied
+# into a target: that would be a cross-tenant EoP).
+#
+# Human brakes: 'hold' label on the PR, or disable this workflow.
+name: auto-merger
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  merge:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch != 'main'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Path to the vendored precondition script. Plan 02-11 copies
+      # docs/target-plumbing/lib/merge-eligibility.sh into the target at this
+      # location alongside this workflow.
+      MERGE_ELIGIBILITY_LIB: .github/workflows/lib/merge-eligibility.sh
+    steps:
+      - name: Check out target repo (for the vendored eligibility script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Ready and merge if eligible
+        env:
+          # head_branch is attacker-controllable (fork PRs reach this via the
+          # workflow_run trigger, which runs with the base repo's write token) and
+          # a branch name may contain $( ) / backticks / shell metacharacters. Never
+          # interpolate it into the script body — read it from the environment (the
+          # same discipline onboard-target.yml uses for untrusted operator input).
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          R="${{ github.repository }}"
+          BRANCH="$HEAD_BRANCH"
+          PR=$(gh pr list -R "$R" --head "$BRANCH" --state open --json number,title \
+            --jq '[.[] | select(.title | test("^T[0-9]+:"))] | .[0].number')
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then
+            echo "No open ticket PR for $BRANCH"; exit 0
+          fi
+
+          # Full GATE-02 precondition chain (hold / App-bot author + verified
+          # commits / all-6-checks-green / autonomy=auto), sourced so the identical
+          # code path runs in production and in the mocked test harness.
+          if [ ! -r "$MERGE_ELIGIBILITY_LIB" ]; then
+            echo "merge-eligibility.sh not found at $MERGE_ELIGIBILITY_LIB — refusing merge (fail closed)"; exit 0
+          fi
+          # shellcheck source=docs/target-plumbing/lib/merge-eligibility.sh
+          . "$MERGE_ELIGIBILITY_LIB"
+          if REASON=$(check_merge_eligibility "$PR" "$R"); then
+            echo "$REASON"
+          else
+            echo "$REASON — skipping"; exit 0
+          fi
+
+          # TDD-red-phase gate (unchanged): a PR with tests but no implementation
+          # yet has no "**Implementation complete**" comment — never merge it.
+          DONE=$(gh pr view "$PR" -R "$R" --json comments \
+            --jq '[.comments[].body | select(startswith("**Implementation complete**"))] | length')
+          if [ "$DONE" -eq 0 ]; then
+            echo "PR #$PR not implemented yet (TDD red phase) — skipping"; exit 0
+          fi
+
+          gh pr ready "$PR" -R "$R"
+          gh pr merge "$PR" -R "$R" --squash --delete-branch

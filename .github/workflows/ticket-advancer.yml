@@ -1,0 +1,203 @@
+# Epic/ticket state machine, run every 3h + on demand. Drives the factory:
+# activates epics (queued->active), dispatches tickets, fires UAT generation
+# (active->uat), advances past accepted epics, and watchdogs dead dispatches
+# (credit exhaustion etc.) with a 3-strike escalation to factory-blocked.
+# Requires secret FACTORY_DISPATCH_PAT (contents: write on the factory, for
+# repository_dispatch only). The state machine's local gh calls use this
+# workflow's own ambient GITHUB_TOKEN, unchanged -- never an App token; this file
+# runs inside each onboarded target repo, where factory App credentials do not exist.
+#
+# Phase 3 (D-11): for a tenant whose vendored .github/factory-config.json says
+# orchestrator_managed:true, the orchestrator owns dispatch. This cron then runs as
+# a SAFETY NET only -- it sources the vendored advancer-mode.sh, and in MANAGED mode
+# it detects stalls and raises a loud orchestrator-stall issue but NEVER dispatches
+# (no double-dispatch by construction). A read-only checkout of THIS target repo is
+# added purely so the run step can source that vendored lib; the advancer never
+# writes to the checkout. Unmanaged/legacy targets (missing config or lib) keep the
+# v2 state machine below byte-for-byte.
+name: ticket-advancer
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  actions: read
+
+jobs:
+  advance:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FACTORY: aleksander-lukashou/darkest-factory
+      # Path to the vendored Phase 3 mode lib. onboard-target.yml copies
+      # docs/target-plumbing/lib/advancer-mode.sh here alongside this workflow.
+      ADVANCER_MODE_LIB: .github/workflows/lib/advancer-mode.sh
+    steps:
+      - name: Check out this target repo (read-only, for the vendored mode lib)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Advance the epic state machine
+        run: |
+          set -euo pipefail
+          R="${{ github.repository }}"
+
+          # ---- Phase 3 mode switch (D-11) ----
+          # Source the vendored mode lib when present. A target onboarded before
+          # Phase 3 has no lib and MUST keep running the v2 state machine, so a
+          # missing/unreadable lib degrades to UNMANAGED (never blocks the legacy
+          # cron). In MANAGED mode this cron is a watchdog only: the orchestrator
+          # owns dispatch, so we detect stalls and raise a loud issue but NEVER
+          # reach any dispatch/activation/UAT/re-dispatch path below (D-09).
+          MODE=UNMANAGED
+          if [ -r "$ADVANCER_MODE_LIB" ]; then
+            # shellcheck source=docs/target-plumbing/lib/advancer-mode.sh
+            . "$ADVANCER_MODE_LIB"
+            MODE=$(check_orchestrator_managed)
+          fi
+          if [ "$MODE" = "MANAGED" ]; then
+            STALLS=$(detect_stalls "$R")
+            if echo "$STALLS" | grep -q '^STALL '; then
+              BODY=$(printf 'Pipeline items are stalled >= 2h while this tenant is orchestrator_managed, so the orchestrator (not this cron) should be driving them:\n\n%s\n\nThe cron does NOT dispatch for a managed tenant (no double-dispatch by construction). Remedy: check the factory `orchestrator-down` / `orchestrator-dlq` issues, or roll this tenant back to the v2 cron via a registry PR (set orchestrator_managed:false).' "$STALLS")
+              EXISTING=$(gh issue list -R "$R" --search "orchestrator-stall in:title" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+              if [ -n "$EXISTING" ]; then
+                gh issue comment "$EXISTING" -R "$R" --body "$BODY" 2>/dev/null || true
+                echo "orchestrator-stall: updated existing loud issue #$EXISTING"
+              else
+                gh label create orchestrator-stall -R "$R" --force --color B60205 --description "Items stalled under orchestrator management" 2>/dev/null || true
+                gh issue create -R "$R" --label orchestrator-stall \
+                  --title "orchestrator-stall: pipeline items stalled under orchestrator management" \
+                  --body "$BODY" 2>/dev/null || true
+                echo "orchestrator-stall: created loud issue for managed tenant"
+              fi
+            else
+              echo "orchestrator-managed: watchdog clean — no stalls"
+            fi
+            exit 0
+          fi
+          # ---- UNMANAGED (v2) path below is byte-identical to pre-Phase-3 ----
+
+          dispatch() { # dispatch <event_type> <json_payload_fragment>
+            curl -sf -X POST \
+              -H "Authorization: Bearer ${{ secrets.FACTORY_DISPATCH_PAT }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$FACTORY/dispatches" \
+              -d "{\"event_type\":\"$1\",\"client_payload\":{\"repo\":\"$R\",$2}}"
+          }
+
+          epic_watchdog() { # epic_watchdog <epic_number> <event_type> <payload_fragment> <what>
+            local EPIC=$1 EVT=$2 PAYLOAD=$3 WHAT=$4
+            local LASTD COUNTD NOWS THENS AGED
+            LASTD=$(gh issue view "$EPIC" -R "$R" --json comments \
+              --jq '[.comments[] | select(.body | startswith("**Factory dispatch**"))] | last | .createdAt // empty' 2>/dev/null || echo "")
+            COUNTD=$(gh issue view "$EPIC" -R "$R" --json comments \
+              --jq '[.comments[] | select(.body | startswith("**Factory dispatch**"))] | length' 2>/dev/null || echo 3)
+            NOWS=$(date -u +%s); THENS=$(date -u -d "${LASTD:-1970-01-01T00:00:00Z}" +%s 2>/dev/null || echo 0)
+            AGED=$(( (NOWS - THENS) / 3600 ))
+            if [ "$AGED" -lt 2 ]; then echo "epic-watchdog: #$EPIC $WHAT dispatched ${AGED}h ago — waiting"; return 0; fi
+            if [ "$COUNTD" -ge 3 ]; then
+              gh label create factory-blocked -R "$R" --force --color B60205 --description "Factory pipeline needs a human"
+              gh issue create -R "$R" --label factory-blocked --title "factory-blocked: epic #$EPIC stalled at $WHAT after 3 dispatches" \
+                --body "Epic #$EPIC was dispatched 3 times for $WHAT with no resulting artifacts. Likely causes: Copilot credit exhaustion (check the factory-red issue in the factory repo) or a persistent agent failure. Fix the cause, close this issue, and the advancer resumes."
+              echo "epic-watchdog: escalated epic #$EPIC at $WHAT"; return 0
+            fi
+            gh issue comment "$EPIC" -R "$R" --body "**Factory dispatch** re-attempt $((COUNTD+1)) for $WHAT (watchdog: no artifacts after ${AGED}h)"
+            dispatch "$EVT" "$PAYLOAD"
+            echo "epic-watchdog: re-dispatched $EVT for epic #$EPIC"
+          }
+
+          # ---- Global gates ----
+          for GATE in main-red factory-blocked; do
+            N=$(gh issue list -R "$R" --label "$GATE" --state open --json number --jq 'length' 2>/dev/null || echo 1)
+            if [ "${N:-0}" -gt 0 ] 2>/dev/null; then echo "gate: open $GATE issue — halting"; exit 0; fi
+          done
+
+          OPEN_T_PRS=$(gh pr list -R "$R" --state open --json title \
+            --jq '[.[] | select(.title | test("^T[0-9]+:"))] | length' 2>/dev/null || echo 1)
+          if [ "$OPEN_T_PRS" -gt 0 ]; then
+            echo "gate: ticket PR in flight (test-writer/W5/auto-merger own it)"; exit 0
+          fi
+
+          # ---- Watchdog: in-progress ticket with no PR and stale dispatch ----
+          STUCK=$(gh issue list -R "$R" --label in-progress --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+          if [ -n "$STUCK" ]; then
+            LAST=$(gh issue view "$STUCK" -R "$R" --json comments \
+              --jq '[.comments[] | select(.body | startswith("**Factory dispatch**"))] | last | .createdAt // empty' 2>/dev/null || echo "")
+            COUNT=$(gh issue view "$STUCK" -R "$R" --json comments \
+              --jq '[.comments[] | select(.body | startswith("**Factory dispatch**"))] | length' 2>/dev/null || echo 3)
+            NOW=$(date -u +%s); THEN=$(date -u -d "${LAST:-1970-01-01T00:00:00Z}" +%s 2>/dev/null || echo 0)
+            AGE=$(( (NOW - THEN) / 3600 ))
+            if [ "$AGE" -lt 2 ]; then echo "watchdog: ticket #$STUCK dispatched ${AGE}h ago — waiting"; exit 0; fi
+            if [ "$COUNT" -ge 3 ]; then
+              gh label create factory-blocked -R "$R" --force --color B60205 --description "Factory pipeline needs a human"
+              gh issue create -R "$R" --label factory-blocked --title "factory-blocked: ticket #$STUCK dead after 3 dispatches" \
+                --body "Ticket #$STUCK was dispatched 3 times with no resulting PR. Likely causes: Copilot credit exhaustion (check the factory-red issue in the factory repo and github.com/settings/copilot), or a persistent agent failure. Fix the cause, close this issue, and the advancer resumes."
+              echo "watchdog: escalated ticket #$STUCK"; exit 0
+            fi
+            gh issue comment "$STUCK" -R "$R" --body "**Factory dispatch** re-attempt $((COUNT+1)) (watchdog: previous dispatch produced no PR in ${AGE}h)"
+            dispatch ticket-ready "\"issue\":$STUCK"
+            echo "watchdog: re-dispatched ticket #$STUCK"; exit 0
+          fi
+
+          # ---- Epic in UAT: advance if accepted, else wait ----
+          UAT_EPIC=$(gh issue list -R "$R" --label epic --label uat --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+          if [ -n "$UAT_EPIC" ]; then
+            ACCEPTED=$(gh issue view "$UAT_EPIC" -R "$R" --json labels --jq '[.labels[].name] | index("uat-accepted") != null' 2>/dev/null || echo false)
+            if [ "$ACCEPTED" != "true" ]; then
+              UAT_ISSUE=$(gh issue list -R "$R" --label uat --state open --limit 50 --json number,body \
+                --jq '[.[] | select(.body | test("#'"$UAT_EPIC"'([^0-9]|$)")) | .number] | .[0] // empty' 2>/dev/null || echo "x")
+              if [ -z "$UAT_ISSUE" ]; then
+                epic_watchdog "$UAT_EPIC" epic-completed "\"epic\":$UAT_EPIC" "UAT generation"; exit 0
+              fi
+              echo "gate: epic #$UAT_EPIC awaiting human UAT (issue #${UAT_ISSUE:-?})"; exit 0
+            fi
+            gh label create accepted -R "$R" --force --color 0E8A16 --description "Epic accepted at UAT"
+            gh issue edit "$UAT_EPIC" -R "$R" --remove-label uat --add-label accepted
+            gh issue close "$UAT_EPIC" -R "$R" --comment "Epic accepted at UAT — factory advancing."
+            OPEN_UATS=$(gh issue list -R "$R" --label uat --state open --limit 50 --json number,body \
+              --jq '[.[] | select(.body | test("#'"$UAT_EPIC"'([^0-9]|$)")) | .number] | join(" ")' 2>/dev/null || echo "")
+            for U in $OPEN_UATS; do
+              gh issue close "$U" -R "$R" --comment "Epic #$UAT_EPIC accepted — closing its Phase UAT issue."
+            done
+            echo "epic #$UAT_EPIC accepted and closed"
+          fi
+
+          # ---- Active epic: dispatch next ticket or complete the epic ----
+          ACTIVE=$(gh issue list -R "$R" --label epic --label active --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+          if [ -n "$ACTIVE" ]; then
+            NEXT=$(gh issue list -R "$R" --label agent-ready --state open --limit 200 --json number,body \
+              --jq '[.[] | select(.body | test("\\*\\*Epic:\\*\\* #'"$ACTIVE"'([^0-9]|$)")) | .number] | sort | .[0] // empty' 2>/dev/null || echo "")
+            if [ -n "$NEXT" ]; then
+              gh label create in-progress -R "$R" --force --color 0E8A16 --description "Factory is implementing this ticket"
+              gh issue edit "$NEXT" -R "$R" --add-label in-progress
+              gh issue comment "$NEXT" -R "$R" --body "**Factory dispatch** attempt 1"
+              dispatch ticket-ready "\"issue\":$NEXT"
+              echo "dispatched ticket #$NEXT of epic #$ACTIVE"; exit 0
+            fi
+            DONE_TICKETS=$(gh issue list -R "$R" --state closed --limit 200 --json number,body \
+              --jq '[.[] | select(.body | test("\\*\\*Epic:\\*\\* #'"$ACTIVE"'([^0-9]|$)"))] | length' 2>/dev/null || echo 0)
+            if [ "$DONE_TICKETS" -eq 0 ]; then
+              epic_watchdog "$ACTIVE" epic-activated "\"epic\":$ACTIVE" "decomposition"; exit 0
+            fi
+            MAIN_CI=$(gh run list -R "$R" -w CI -b main --limit 1 --json conclusion --jq '.[0].conclusion // "none"' 2>/dev/null || echo none)
+            if [ "$MAIN_CI" != "success" ]; then
+              echo "epic #$ACTIVE tickets done but main CI is $MAIN_CI — waiting for green staging"; exit 0
+            fi
+            gh label create uat -R "$R" --force --color FBCA04 --description "Epic awaiting human UAT"
+            gh label create uat-accepted -R "$R" --force --color 0E8A16 --description "Human accepted this epic at UAT"
+            gh issue edit "$ACTIVE" -R "$R" --remove-label active --add-label uat
+            dispatch epic-completed "\"epic\":$ACTIVE"
+            echo "epic #$ACTIVE complete — UAT generation dispatched"; exit 0
+          fi
+
+          # ---- No active epic: activate the next queued one ----
+          QUEUED=$(gh issue list -R "$R" --label epic --label queued --state open --json number --jq '[.[].number] | sort | .[0] // empty' 2>/dev/null || echo "")
+          if [ -z "$QUEUED" ]; then echo "no queued epics — factory idle"; exit 0; fi
+          gh label create active -R "$R" --force --color 1D76DB --description "Epic in implementation"
+          gh issue edit "$QUEUED" -R "$R" --remove-label queued --add-label active
+          gh issue comment "$QUEUED" -R "$R" --body "**Factory dispatch** epic activated — decomposer incoming"
+          dispatch epic-activated "\"epic\":$QUEUED"
+          echo "activated epic #$QUEUED"

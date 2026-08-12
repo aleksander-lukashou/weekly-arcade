@@ -37,3 +37,130 @@ jobs:
             node --check "$f"
             echo "syntax OK: $f"
           done
+
+  tests-guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'tests-amended')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Acceptance tests unchanged since first commit
+        run: |
+          git fetch origin "${{ github.base_ref }}"
+          FIRST=$(git rev-list --reverse "origin/${{ github.base_ref }}"..HEAD | head -1)
+          if [ -z "$FIRST" ]; then echo "No commits — ok"; exit 0; fi
+          CHANGED=$(git diff --name-only "$FIRST"..HEAD -- tests/acceptance/)
+          if [ -n "$CHANGED" ]; then
+            echo "::error::tests/acceptance modified after the test-writer commit:"; echo "$CHANGED"; exit 1
+          fi
+          echo "Acceptance tests unmodified — ok"
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch base ref
+        run: git fetch origin "${{ github.base_ref }}"
+      - name: Download and verify gitleaks v8.30.1
+        run: |
+          set -euo pipefail
+          VERSION=8.30.1
+          ARCHIVE="gitleaks_${VERSION}_linux_x64.tar.gz"
+          BASE="https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}"
+          curl -sSL "${BASE}/${ARCHIVE}" -o gitleaks.tar.gz
+          curl -sSL "${BASE}/gitleaks_${VERSION}_checksums.txt" -o gitleaks_checksums.txt
+          # Verify the archive SHA256 against the published checksums BEFORE extracting.
+          EXPECTED=$(grep " ${ARCHIVE}\$" gitleaks_checksums.txt | awk '{print $1}')
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::could not find published checksum for ${ARCHIVE}"; exit 1
+          fi
+          echo "${EXPECTED}  gitleaks.tar.gz" | sha256sum -c - || {
+            echo "::error::gitleaks archive SHA256 mismatch — refusing to extract an unverified binary"; exit 1
+          }
+      - name: Extract gitleaks
+        run: tar -xzf gitleaks.tar.gz gitleaks
+      - name: Scan full commit range for secrets
+        run: |
+          set -euo pipefail
+          # Full base..HEAD range scan (not HEAD-only) — a secret in any commit in
+          # the range fails the gate. gitleaks exits 1 on findings; propagate it.
+          if ! ./gitleaks git --no-banner --redact \
+            --log-opts "origin/${{ github.base_ref }}..HEAD"; then
+            echo "::error::gitleaks found a secret in the PR commit range (origin/${{ github.base_ref }}..HEAD)"
+            exit 1
+          fi
+
+  dependency-gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24
+      - name: Fetch base ref
+        run: git fetch origin "${{ github.base_ref }}"
+      - name: Gate new dependencies against the factory policy
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: node .github/workflows/lib/dependency-gate.mjs
+
+  migration-gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24
+      - name: Fetch base ref
+        run: git fetch origin "${{ github.base_ref }}"
+      - name: Gate destructive migrations against the factory policy
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/workflows/lib/migration-gate.mjs
+
+  deploy-preview:
+    runs-on: ubuntu-latest
+    # Job-level grant: the PR-comment step posts via GITHUB_TOKEN, and the
+    # target CI's workflow-level default is read-only (live-caught on
+    # habit-tracker#35: "Resource not accessible by integration").
+    permissions:
+      contents: read
+      pull-requests: write
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.ref_name != 'main' &&
+      github.ref_name != 'prod'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy preview
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Branch alias is sanitized by CF (lowercased, non-alphanumeric -> hyphen):
+          # T101-add-export -> t101-add-export.<project>.pages.dev
+          command: pages deploy . --project-name=${{ vars.PAGES_PROJECT }} --branch=${{ github.head_ref || github.ref_name }}
+      - name: Comment preview URL on PR
+        if: github.event_name == 'pull_request'
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.pages-deployment-alias-url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --body "Preview: ${PREVIEW_URL}"
