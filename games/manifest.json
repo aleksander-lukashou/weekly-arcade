@@ -8,5 +8,14 @@
       "source": "https://www.bbc.co.uk/news/articles/cy5d11g72ppo",
       "path": "games/2026-w33-call-dodger/"
     }
+    ,
+    {
+      "slug": "bid-frenzy",
+      "title": "Bid Frenzy",
+      "date": "2026-08-17",
+      "headline": "Ferrari's first ever electric car sold for record $40m",
+      "source": "https://www.bbc.co.uk/news/articles/c77ggpgrp2do",
+      "path": "games/2026-w34-bid-frenzy/"
+    }
   ]
 }
