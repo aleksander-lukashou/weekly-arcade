@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bid Frenzy</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a14;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: sans-serif;
+      color: #ccc;
+    }
+    #header {
+      text-align: center;
+      margin-bottom: 10px;
+    }
+    #header h1 { font-size: 1.5rem; color: #ffd232; letter-spacing: 2px; }
+    #header p  { font-size: 0.8rem; color: #8888aa; margin-top: 4px; }
+    canvas { display: block; max-width: 100%; }
+    #footer {
+      margin-top: 10px;
+      font-size: 0.75rem;
+      color: #555;
+    }
+    #footer a { color: #6688cc; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <h1>Bid Frenzy</h1>
+    <p>Catch gold bids ✦ Dodge red lowballs ✦ Hit $40M to close the auction</p>
+    <p style="font-size:0.7rem;color:#555;margin-top:2px;">← / → or mouse/touch to move the paddle</p>
+  </div>
+  <script src="../../lib/kaboom.js"></script>
+  <script src="./game.js"></script>
+  <div id="footer"><a href="../../index.html">← arcade</a></div>
+</body>
+</html>
